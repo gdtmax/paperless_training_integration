@@ -1,3 +1,4 @@
+import os
 import yaml
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -66,10 +67,36 @@ def check_gate(model_type, metrics, gate_config):
 
 
 # ========================
+# 查找最近一次 training run,用于 register_model
+# ========================
+def find_latest_training_run(client, model_type):
+    """Return (run_id, run) for the most recent training run matching
+    this model_type, or (None, None) if there isn't one yet."""
+    experiment = client.get_experiment_by_name(
+        os.environ.get("MLFLOW_TRAINING_EXPERIMENT", "training")
+    )
+    if experiment is None:
+        return None, None
+
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        order_by=["start_time DESC"],
+    )
+    for run in runs:
+        run_name = run.data.tags.get("mlflow.runName", "")
+        # match runs like "htr_baseline", "retrieval_large_batch", etc.
+        if run_name.startswith(f"{model_type}_"):
+            return run.info.run_id, run
+    return None, None
+
+
+# ========================
 # 主函数
 # ========================
 def main():
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    # Tracking URI env-overridable so the same gate logic runs against
+    # a shared MLflow server (e.g. http://mlflow:5000 inside compose).
+    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
     mlflow.set_experiment("quality_gate")
 
     client = MlflowClient()
@@ -99,8 +126,30 @@ def main():
 
         results[model_type] = {
             "status": "PASS" if passed else "FAIL",
-            "reason": reason
+            "reason": reason,
+            "registered_version": None,
         }
+
+        # On PASS, promote to the Model Registry so downstream deploy
+        # scripts (e.g. paperless-ml/scripts/deploy_model.sh) can find
+        # the latest gated model via `models:/paperless-<type>`. This is
+        # the canonical rubric pattern — "saved models are registered
+        # ONLY if they pass the quality gate."
+        if passed:
+            run_id, _ = find_latest_training_run(client, model_type)
+            if run_id is None:
+                print(f"  (no training run for {model_type} — skipping register_model)")
+            else:
+                model_uri = f"runs:/{run_id}/model"
+                try:
+                    mv = mlflow.register_model(
+                        model_uri=model_uri,
+                        name=f"paperless-{model_type}",
+                    )
+                    results[model_type]["registered_version"] = mv.version
+                    print(f"  registered paperless-{model_type} v{mv.version} from {model_uri}")
+                except Exception as e:
+                    print(f"  register_model failed for {model_type}: {e}")
 
         print(f"{model_type}: {results[model_type]}")
 
@@ -109,6 +158,8 @@ def main():
             mlflow.log_param("model_type", model_type)
             mlflow.log_param("status", results[model_type]["status"])
             mlflow.log_param("reason", results[model_type]["reason"])
+            if results[model_type]["registered_version"] is not None:
+                mlflow.log_param("registered_version", results[model_type]["registered_version"])
 
     print("\n===== FINAL RESULT =====")
     for k, v in results.items():

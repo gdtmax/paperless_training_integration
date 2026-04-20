@@ -1,10 +1,15 @@
+import os
 import mlflow
 import subprocess
 
 
 def setup_mlflow():
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
-    mlflow.set_experiment("training")
+    # Tracking URI defaults to the local dev server but can be overridden
+    # via MLFLOW_TRACKING_URI so the same code runs against a shared
+    # compose-internal server (e.g. http://mlflow:5000) without edits.
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "training"))
 
 
 def log_basic_params(exp_config, model_type):

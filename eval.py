@@ -80,7 +80,9 @@ def evaluate_model(model_type, model_config):
 
 
 def main():
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    # Tracking URI env-overridable so eval runs against a shared MLflow
+    # (e.g. http://mlflow:5000 inside compose) without editing code.
+    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
     mlflow.set_experiment("evaluation")
 
     with open("configs/eval_config.yaml", "r") as f:
