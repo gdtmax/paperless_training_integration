@@ -87,6 +87,10 @@ def train(model_type, exp_config, model_config):
         # register it via `runs:/<run_id>/model` on gate pass. The local
         # checkpoint at outputs/checkpoints/ remains the source of truth
         # for eval.py (which loads via filesystem), so this is additive.
+        # Switch to eval mode first — mlflow.pytorch.log_model preserves
+        # the current training/eval flag, and a model loaded for
+        # inference should have dropout/batchnorm in eval mode.
+        model.eval()
         mlflow.pytorch.log_model(model, artifact_path="model")
 
         print(f"Saved model to: {save_path}")

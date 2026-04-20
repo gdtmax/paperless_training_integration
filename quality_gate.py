@@ -129,9 +129,14 @@ def main():
 
         passed, reason = check_gate(model_type, metrics, gate_cfg)
 
+        # `status` is the gate-metric verdict only. `registration_status`
+        # is orthogonal — it tracks whether promotion to the Model
+        # Registry actually happened. Keeping the two separate avoids
+        # the internally-inconsistent "PASS but not registered" state.
         results[model_type] = {
             "status": "PASS" if passed else "FAIL",
             "reason": reason,
+            "registration_status": "NOT_APPLICABLE",   # gate didn't pass
             "registered_version": None,
             "register_error": None,
         }
@@ -141,15 +146,11 @@ def main():
         # the latest gated model via `models:/paperless-<type>`. This is
         # the canonical rubric pattern — "saved models are registered
         # ONLY if they pass the quality gate."
-        #
-        # If registration itself fails (e.g. MLflow registry down), we
-        # capture the error in results + log it on the gate run so the
-        # failure isn't silently masked by a PASS status from the
-        # metric-threshold check.
         if passed:
             run_id, _ = find_baseline_training_run(client, model_type)
             if run_id is None:
                 msg = f"no `{model_type}_baseline` training run found"
+                results[model_type]["registration_status"] = "SKIPPED"
                 results[model_type]["register_error"] = msg
                 print(f"  skipping register_model: {msg}")
             else:
@@ -159,9 +160,11 @@ def main():
                         model_uri=model_uri,
                         name=f"paperless-{model_type}",
                     )
+                    results[model_type]["registration_status"] = "REGISTERED"
                     results[model_type]["registered_version"] = mv.version
                     print(f"  registered paperless-{model_type} v{mv.version} from {model_uri}")
                 except Exception as e:
+                    results[model_type]["registration_status"] = "FAILED"
                     results[model_type]["register_error"] = str(e)
                     print(f"  register_model failed for {model_type}: {e}")
 
@@ -172,10 +175,13 @@ def main():
             mlflow.log_param("model_type", model_type)
             mlflow.log_param("status", results[model_type]["status"])
             mlflow.log_param("reason", results[model_type]["reason"])
+            mlflow.log_param("registration_status", results[model_type]["registration_status"])
             if results[model_type]["registered_version"] is not None:
                 mlflow.log_param("registered_version", results[model_type]["registered_version"])
+            # Exception strings can exceed MLflow's param length limit
+            # (~500 chars). Tags tolerate ~5000, so use set_tag here.
             if results[model_type]["register_error"] is not None:
-                mlflow.log_param("register_error", results[model_type]["register_error"])
+                mlflow.set_tag("register_error", results[model_type]["register_error"])
 
     print("\n===== FINAL RESULT =====")
     for k, v in results.items():
