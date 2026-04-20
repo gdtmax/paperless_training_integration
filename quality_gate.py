@@ -67,26 +67,31 @@ def check_gate(model_type, metrics, gate_config):
 
 
 # ========================
-# 查找最近一次 training run,用于 register_model
+# 查找 baseline training run,用于 register_model
 # ========================
-def find_latest_training_run(client, model_type):
-    """Return (run_id, run) for the most recent training run matching
-    this model_type, or (None, None) if there isn't one yet."""
-    experiment = client.get_experiment_by_name(
-        os.environ.get("MLFLOW_TRAINING_EXPERIMENT", "training")
-    )
+def find_baseline_training_run(client, model_type):
+    """Return (run_id, run) for the `{model_type}_baseline` training
+    run, or (None, None) if there isn't one yet.
+
+    Note: eval.py loads the fixed checkpoint at
+    outputs/checkpoints/{model_type}_baseline.pt, so the quality gate's
+    PASS/FAIL decision is always about the `baseline` run specifically.
+    We register the SAME run's logged model artifact here to keep
+    evaluation and registration referring to the same weights.
+    """
+    experiment = client.get_experiment_by_name("training")
     if experiment is None:
         return None, None
 
+    run_name = f"{model_type}_baseline"
     runs = client.search_runs(
         experiment_ids=[experiment.experiment_id],
+        filter_string=f"tags.mlflow.runName = '{run_name}'",
         order_by=["start_time DESC"],
+        max_results=1,
     )
-    for run in runs:
-        run_name = run.data.tags.get("mlflow.runName", "")
-        # match runs like "htr_baseline", "retrieval_large_batch", etc.
-        if run_name.startswith(f"{model_type}_"):
-            return run.info.run_id, run
+    if runs:
+        return runs[0].info.run_id, runs[0]
     return None, None
 
 
@@ -128,6 +133,7 @@ def main():
             "status": "PASS" if passed else "FAIL",
             "reason": reason,
             "registered_version": None,
+            "register_error": None,
         }
 
         # On PASS, promote to the Model Registry so downstream deploy
@@ -135,10 +141,17 @@ def main():
         # the latest gated model via `models:/paperless-<type>`. This is
         # the canonical rubric pattern — "saved models are registered
         # ONLY if they pass the quality gate."
+        #
+        # If registration itself fails (e.g. MLflow registry down), we
+        # capture the error in results + log it on the gate run so the
+        # failure isn't silently masked by a PASS status from the
+        # metric-threshold check.
         if passed:
-            run_id, _ = find_latest_training_run(client, model_type)
+            run_id, _ = find_baseline_training_run(client, model_type)
             if run_id is None:
-                print(f"  (no training run for {model_type} — skipping register_model)")
+                msg = f"no `{model_type}_baseline` training run found"
+                results[model_type]["register_error"] = msg
+                print(f"  skipping register_model: {msg}")
             else:
                 model_uri = f"runs:/{run_id}/model"
                 try:
@@ -149,6 +162,7 @@ def main():
                     results[model_type]["registered_version"] = mv.version
                     print(f"  registered paperless-{model_type} v{mv.version} from {model_uri}")
                 except Exception as e:
+                    results[model_type]["register_error"] = str(e)
                     print(f"  register_model failed for {model_type}: {e}")
 
         print(f"{model_type}: {results[model_type]}")
@@ -160,6 +174,8 @@ def main():
             mlflow.log_param("reason", results[model_type]["reason"])
             if results[model_type]["registered_version"] is not None:
                 mlflow.log_param("registered_version", results[model_type]["registered_version"])
+            if results[model_type]["register_error"] is not None:
+                mlflow.log_param("register_error", results[model_type]["register_error"])
 
     print("\n===== FINAL RESULT =====")
     for k, v in results.items():

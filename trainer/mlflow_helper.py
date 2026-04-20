@@ -9,7 +9,7 @@ def setup_mlflow():
     # compose-internal server (e.g. http://mlflow:5000) without edits.
     tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
     mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "training"))
+    mlflow.set_experiment("training")
 
 
 def log_basic_params(exp_config, model_type):
