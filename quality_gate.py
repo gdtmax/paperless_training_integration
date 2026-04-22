@@ -1,3 +1,4 @@
+import os
 import yaml
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -66,10 +67,41 @@ def check_gate(model_type, metrics, gate_config):
 
 
 # ========================
+# 查找 baseline training run,用于 register_model
+# ========================
+def find_baseline_training_run(client, model_type):
+    """Return (run_id, run) for the `{model_type}_baseline` training
+    run, or (None, None) if there isn't one yet.
+
+    Note: eval.py loads the fixed checkpoint at
+    outputs/checkpoints/{model_type}_baseline.pt, so the quality gate's
+    PASS/FAIL decision is always about the `baseline` run specifically.
+    We register the SAME run's logged model artifact here to keep
+    evaluation and registration referring to the same weights.
+    """
+    experiment = client.get_experiment_by_name("training")
+    if experiment is None:
+        return None, None
+
+    run_name = f"{model_type}_baseline"
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"tags.mlflow.runName = '{run_name}'",
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if runs:
+        return runs[0].info.run_id, runs[0]
+    return None, None
+
+
+# ========================
 # 主函数
 # ========================
 def main():
-    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    # Tracking URI env-overridable so the same gate logic runs against
+    # a shared MLflow server (e.g. http://mlflow:5000 inside compose).
+    mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
     mlflow.set_experiment("quality_gate")
 
     client = MlflowClient()
@@ -97,10 +129,44 @@ def main():
 
         passed, reason = check_gate(model_type, metrics, gate_cfg)
 
+        # `status` is the gate-metric verdict only. `registration_status`
+        # is orthogonal — it tracks whether promotion to the Model
+        # Registry actually happened. Keeping the two separate avoids
+        # the internally-inconsistent "PASS but not registered" state.
         results[model_type] = {
             "status": "PASS" if passed else "FAIL",
-            "reason": reason
+            "reason": reason,
+            "registration_status": "NOT_APPLICABLE",   # gate didn't pass
+            "registered_version": None,
+            "register_error": None,
         }
+
+        # On PASS, promote to the Model Registry so downstream deploy
+        # scripts (e.g. paperless-ml/scripts/deploy_model.sh) can find
+        # the latest gated model via `models:/paperless-<type>`. This is
+        # the canonical rubric pattern — "saved models are registered
+        # ONLY if they pass the quality gate."
+        if passed:
+            run_id, _ = find_baseline_training_run(client, model_type)
+            if run_id is None:
+                msg = f"no `{model_type}_baseline` training run found"
+                results[model_type]["registration_status"] = "SKIPPED"
+                results[model_type]["register_error"] = msg
+                print(f"  skipping register_model: {msg}")
+            else:
+                model_uri = f"runs:/{run_id}/model"
+                try:
+                    mv = mlflow.register_model(
+                        model_uri=model_uri,
+                        name=f"paperless-{model_type}",
+                    )
+                    results[model_type]["registration_status"] = "REGISTERED"
+                    results[model_type]["registered_version"] = mv.version
+                    print(f"  registered paperless-{model_type} v{mv.version} from {model_uri}")
+                except Exception as e:
+                    results[model_type]["registration_status"] = "FAILED"
+                    results[model_type]["register_error"] = str(e)
+                    print(f"  register_model failed for {model_type}: {e}")
 
         print(f"{model_type}: {results[model_type]}")
 
@@ -109,6 +175,13 @@ def main():
             mlflow.log_param("model_type", model_type)
             mlflow.log_param("status", results[model_type]["status"])
             mlflow.log_param("reason", results[model_type]["reason"])
+            mlflow.log_param("registration_status", results[model_type]["registration_status"])
+            if results[model_type]["registered_version"] is not None:
+                mlflow.log_param("registered_version", results[model_type]["registered_version"])
+            # Exception strings can exceed MLflow's param length limit
+            # (~500 chars). Tags tolerate ~5000, so use set_tag here.
+            if results[model_type]["register_error"] is not None:
+                mlflow.set_tag("register_error", results[model_type]["register_error"])
 
     print("\n===== FINAL RESULT =====")
     for k, v in results.items():
